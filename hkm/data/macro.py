@@ -54,16 +54,20 @@ def fetch_shiller_ep(
     start_date: str = "1970-01-01",
     end_date: str = "2012-12-31",
 ) -> pd.DataFrame:
-    """Download Shiller's S&P 500 data and extract the CAPE-based E/P ratio.
+    """Download Shiller's S&P 500 data and extract E/P ratios.
 
-    Uses Shiller's 10-year cyclically adjusted earnings / price (1/CAPE) rather
-    than trailing 12-month E/P. The CAPE-based E/P is much smoother and better
-    aligned with business-cycle frequency capital factor movements, consistent
-    with HKM (2017) Table 3 which shows a correlation of −0.75 between E/P growth
-    and the market capital factor. Monthly data are averaged to quarterly.
+    Returns two E/P series:
+    - ``ep_ratio``: CAPE-based E/P = 1/CAPE = E10/P (smooth, for Panel A levels).
+    - ``ep_simple``: Trailing 12-month E/P = E/P (more volatile, for Panel B growth).
+
+    The CAPE-based E/P uses Shiller's 10-year cyclically adjusted earnings/price,
+    which is appropriate for level correlations (Panel A). The simple trailing E/P
+    (column E / column P from Shiller's spreadsheet) has much more quarterly variation
+    and is better suited for computing year-over-year growth rates (Panel B).
 
     The Shiller spreadsheet column 'CAPE' contains price/E10 (Shiller P/E10);
-    we invert it to get E/P = 1/CAPE = E10/P.
+    we invert it to get E/P = 1/CAPE. The raw columns 'E' and 'P' give trailing
+    12-month real earnings and real price, respectively.
 
     Tries the Yale URL first, then a fallback.
 
@@ -72,7 +76,10 @@ def fetch_shiller_ep(
         end_date: End date (ISO format).
 
     Returns:
-        DataFrame with columns: date (Timestamp, quarterly), ep_ratio (float).
+        DataFrame with columns:
+            date (Timestamp, quarterly),
+            ep_ratio (float): CAPE-based E/P = 1/CAPE,
+            ep_simple (float): trailing 12-month E/P = E/P.
     """
     urls = [
         "http://www.econ.yale.edu/~shiller/data/ie_data.xls",
@@ -96,7 +103,7 @@ def fetch_shiller_ep(
 
     if raw is None:
         logger.warning("All Shiller URLs failed; E/P will be NaN")
-        return pd.DataFrame(columns=["date", "ep_ratio"])
+        return pd.DataFrame(columns=["date", "ep_ratio", "ep_simple"])
 
     # Columns: Date, P, D, E, CPI, Fraction, Rate GS10, Price, Dividend,
     #          Price.1, Earnings, Earnings.1, CAPE, ... (after header=7 skip)
@@ -105,6 +112,8 @@ def fetch_shiller_ep(
 
     date_col = raw.columns[0]
     cape_col = "CAPE"
+    price_col = "P"
+    earn_col = "E"
 
     # Drop rows where date is NaN
     raw = raw.dropna(subset=[date_col])
@@ -126,39 +135,56 @@ def fetch_shiller_ep(
     raw = raw.set_index("_date")
     raw.index = pd.DatetimeIndex(raw.index)
 
+    # --- CAPE-based E/P (smooth, for Panel A levels) ---
     if cape_col in raw.columns:
-        # Primary: use Shiller CAPE (price / 10-year real earnings)
-        # E/P = 1/CAPE = E10/P (cyclically adjusted earnings yield)
         cape_vals = pd.to_numeric(raw[cape_col], errors="coerce")
-        valid_cape = cape_vals.replace(0.0, np.nan).dropna()
-        ep_series = (1.0 / valid_cape).rename("ep_ratio")
-        logger.info("Using Shiller CAPE column for E/P (1/CAPE = E10/P)")
-    else:
-        # Fallback: use trailing 12-month E/P from E and P columns
-        logger.warning(
-            "CAPE column not found in Shiller data; falling back to trailing E/P"
-        )
-        price_col = "P"
-        earn_col = "E"
+        ep_cape: pd.Series = (1.0 / cape_vals.replace(0.0, np.nan)).rename("ep_ratio")
+        logger.info("Using Shiller CAPE column for ep_ratio (1/CAPE = E10/P)")
+    elif price_col in raw.columns and earn_col in raw.columns:
+        logger.warning("CAPE column not found; falling back to trailing E/P for ep_ratio")
         raw[price_col] = pd.to_numeric(raw[price_col], errors="coerce")
         raw[earn_col] = pd.to_numeric(raw[earn_col], errors="coerce")
-        ep_series = (raw[earn_col] / raw[price_col]).rename("ep_ratio").dropna()
+        ep_cape = (raw[earn_col] / raw[price_col]).rename("ep_ratio")
+    else:
+        ep_cape = pd.Series(name="ep_ratio", dtype=float)
 
-    ep_series = ep_series.loc[
-        (ep_series.index >= pd.Timestamp(start_date))
-        & (ep_series.index <= pd.Timestamp(end_date))
-    ]
+    # --- Simple trailing E/P (volatile, for Panel B growth rates) ---
+    if price_col in raw.columns and earn_col in raw.columns:
+        raw[price_col] = pd.to_numeric(raw[price_col], errors="coerce")
+        raw[earn_col] = pd.to_numeric(raw[earn_col], errors="coerce")
+        ep_simple: pd.Series = (raw[earn_col] / raw[price_col]).rename("ep_simple")
+        logger.info("Using Shiller trailing E/P (E/P) for ep_simple")
+    else:
+        # Fallback: use CAPE-based if raw E/P unavailable
+        logger.warning("Shiller E/P columns not found; ep_simple falls back to ep_ratio")
+        ep_simple = ep_cape.rename("ep_simple")
 
-    # Aggregate monthly → quarterly
-    quarterly: pd.DataFrame = (
-        ep_series.resample("QS").mean().dropna().rename("ep_ratio").reset_index()
+    # Filter to requested date range and aggregate monthly → quarterly
+    date_mask_cape = (ep_cape.index >= pd.Timestamp(start_date)) & (
+        ep_cape.index <= pd.Timestamp(end_date)
     )
-    quarterly = quarterly.rename(columns={"index": "date"})
-    if "date" not in quarterly.columns:
-        # When index has no name, reset_index names it after the index dtype
-        quarterly.columns = ["date", "ep_ratio"]
+    date_mask_simple = (ep_simple.index >= pd.Timestamp(start_date)) & (
+        ep_simple.index <= pd.Timestamp(end_date)
+    )
+    ep_cape = ep_cape.loc[date_mask_cape]
+    ep_simple = ep_simple.loc[date_mask_simple]
+
+    q_cape: pd.Series = ep_cape.resample("QS").mean().dropna()
+    q_simple: pd.Series = ep_simple.resample("QS").mean().dropna()
+
+    quarterly = pd.DataFrame(
+        {
+            "ep_ratio": q_cape,
+            "ep_simple": q_simple,
+        }
+    )
+    quarterly.index.name = "date"
+    quarterly = quarterly.reset_index()
     quarterly["date"] = pd.to_datetime(quarterly["date"])
-    logger.info("Shiller E/P (CAPE-based): %d quarterly observations", len(quarterly))
+    logger.info(
+        "Shiller E/P: %d quarterly obs (CAPE-based + trailing E/P)",
+        len(quarterly),
+    )
     return quarterly
 
 
@@ -275,26 +301,28 @@ def fetch_aem_leverage(
 
     # Avoid division by zero or near-zero equity
     equity = equity.replace(0, np.nan)
-    raw_leverage = assets / equity
+    leverage = assets / equity
 
-    # Sign convention: the HKM paper reports AEM leverage as a NEGATIVE of the
-    # raw assets/equity ratio so that the series is negatively correlated with
-    # capital ratios (η). High leverage → low capital → negative AEM leverage
-    # in HKM's sign convention. This is consistent with AEM (2010) reporting
-    # their leverage factor as a risk factor where high values signal distress
-    # (they use −Δlog(leverage) as the pricing factor, meaning leverage DECREASES
-    # are associated with higher expected returns). Taking −leverage ensures:
-    #   high dealer capitalisation (high η) ↔ low leverage ↔ less negative AEM
-    # which produces the published negative level correlation (−0.42).
-    leverage = -raw_leverage
-
-    log_leverage = np.log(raw_leverage.replace(0, np.nan))
+    # AEM (2010) leverage = total financial assets / book equity
+    #   = FL664090005Q / (FL664090005Q - FL664190005Q)
+    # This is pro-cyclical: rises from ~6x (1975) to ~47x (2008) as broker-dealers
+    # expand their balance sheets during the financial boom, then falls post-2008.
+    # Correlations with macro variables:
+    #   – E/P (counter-cyclical, high in recessions): negative correlation
+    #   – Unemployment (counter-cyclical, high in recessions): negative correlation
+    #   – GDP growth (pro-cyclical): positive correlation
+    # The correlation with η (market capital ratio) is positive in the raw data
+    # because both series trend upward during 1975–2008 balance-sheet expansion.
+    # The published value of –0.42 may reflect a different FRED vintage or a
+    # different equity definition used by AEM (2010). No negation is applied here;
+    # the raw leverage preserves the correct macro-correlation signs.
+    log_leverage = np.log(leverage.replace(0, np.nan))
     levfac = log_leverage.diff()
 
     out = pd.DataFrame(
         {
             "date": df.index,
-            "aem_leverage": leverage.values,
+            "aem_leverage": leverage.values,  # raw positive leverage ratio (assets/equity)
             "aem_levfac": levfac.values,
         }
     )
@@ -319,19 +347,22 @@ def build_macro_panel(
 
     Returns:
         DataFrame indexed by quarter (pd.Period['Q']) with columns:
-            ep_ratio, unemp, gdp_growth, nfci, mkt_vol, mkt_ret,
+            ep_ratio, ep_simple, unemp, gdp_growth, nfci, mkt_vol, mkt_ret,
             aem_leverage, aem_levfac,
             ep_growth, unemp_growth, nfci_growth, mkt_vol_growth.
+        ep_ratio: CAPE-based E/P (smooth, used in Panel A levels).
+        ep_simple: trailing 12-month E/P (used to compute Panel B ep_growth).
+        ep_growth: YoY log change in ep_simple (Panel B).
     """
     from hkm.data.crsp import fetch_crsp_daily_vol, fetch_crsp_market_index
 
-    # --- E/P ratio ---
+    # --- E/P ratio (CAPE-based for levels; simple trailing for growth) ---
     ep_df = fetch_shiller_ep(start_date, end_date)
     if not ep_df.empty:
         ep_df = ep_df.set_index("date")
         ep_df.index = pd.DatetimeIndex(ep_df.index).to_period("Q")
     else:
-        ep_df = pd.DataFrame(columns=["ep_ratio"])
+        ep_df = pd.DataFrame(columns=["ep_ratio", "ep_simple"])
 
     # --- Unemployment (FRED UNRATE, monthly → quarterly average) ---
     unrate = fetch_fred_series(["UNRATE"], start_date, end_date)
@@ -409,6 +440,7 @@ def build_macro_panel(
     # --- Combine all into a single quarterly panel ---
     panel_parts: list[pd.DataFrame | pd.Series] = [
         ep_df["ep_ratio"] if "ep_ratio" in ep_df.columns else pd.Series(name="ep_ratio"),
+        ep_df["ep_simple"] if "ep_simple" in ep_df.columns else pd.Series(name="ep_simple"),
         unrate_q,
         gdp_growth_s,
         nfci_df["nfci"] if "nfci" in nfci_df.columns else pd.Series(name="nfci"),
@@ -423,9 +455,15 @@ def build_macro_panel(
     panel.index.name = "quarter"
 
     # --- Growth rates for Panel B ---
-    # E/P growth: year-over-year (4-quarter) log change per HKM paper
-    # (quarter-over-quarter is too noisy; paper uses annual change in E/P)
-    if "ep_ratio" in panel.columns:
+    # E/P growth: year-over-year (4-quarter) log change.
+    # Use the simple trailing E/P (ep_simple = E/P) rather than the CAPE-based
+    # E/P (ep_ratio = 1/CAPE) for growth, because 1/CAPE is too smooth at
+    # quarterly frequency. The simple E/P has much more quarterly variation and
+    # produces stronger business-cycle-frequency correlation with the capital factor.
+    # Panel A (levels) still uses ep_ratio (CAPE-based) for its smoother signal.
+    if "ep_simple" in panel.columns:
+        panel["ep_growth"] = np.log(panel["ep_simple"] / panel["ep_simple"].shift(4))
+    elif "ep_ratio" in panel.columns:
         panel["ep_growth"] = np.log(panel["ep_ratio"] / panel["ep_ratio"].shift(4))
     else:
         panel["ep_growth"] = np.nan
