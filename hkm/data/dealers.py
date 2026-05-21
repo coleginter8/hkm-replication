@@ -95,10 +95,10 @@ PRIMARY_DEALERS: list[Dealer] = [
         start=datetime.date(1977, 11, 2),
         end=datetime.date(1998, 4, 30),
     ),
-    # ---- Dealers with unknown GVKEYs (resolved at runtime) ----
+    # ---- Dealers with known GVKEYs (verified) ----
     Dealer(
         "Salomon Smith Barney",
-        gvkey=None,
+        gvkey="008537",  # CITIGROUP GLOBAL MKTS HLDGS (formerly Smith Barney Holdings, SIC 6211)
         permno=None,
         start=datetime.date(1960, 5, 19),
         end=datetime.date(2003, 4, 6),
@@ -290,7 +290,12 @@ PRIMARY_DEALERS: list[Dealer] = [
         gvkey="002943",  # CHASE MANHATTAN CORP -OLD (verified in comp.names)
         permno=None,
         start=datetime.date(1970, 10, 12),
-        end=datetime.date(2001, 4, 30),
+        # Chase Manhattan filed its last Compustat quarterly report in 1995Q4
+        # after merging with Chemical Bank (effective 1996-03-31). The entity
+        # became JPMorgan Chase via the 2000 merger; JPMorgan (gvkey 002968) covers
+        # the post-merger combined entity.  Truncate here to avoid carrying stale
+        # 1995 balance-sheet data forward through 2001.
+        end=datetime.date(1995, 12, 31),
     ),
     Dealer(
         "First National Bank of Boston",

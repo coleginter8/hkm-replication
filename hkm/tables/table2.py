@@ -128,52 +128,6 @@ def _compute_table2_with_conn(
         entry = (int(row["permno"]), row["linkdt"], row["linkenddt"])
         gvkey_to_links.setdefault(gv, []).append(entry)
 
-    # ---- Fetch CRSP SIC codes for dealer PERMNOs (for group classification) ----
-    from hkm.data.wrds_connect import run_query
-
-    dealer_sic_df = pd.DataFrame(columns=["permno", "siccd", "namedt", "nameendt"])
-    if all_dealer_permnos:
-        perm_ph = ", ".join(str(p) for p in all_dealer_permnos)
-        sic_sql = f"""
-            SELECT permno, siccd, namedt, nameendt
-            FROM crsp.msenames
-            WHERE permno IN ({perm_ph})
-            ORDER BY permno, namedt
-        """
-        dealer_sic_raw = run_query(sic_sql, conn)
-        if not dealer_sic_raw.empty:
-            dealer_sic_raw["permno"] = dealer_sic_raw["permno"].astype(int)
-            dealer_sic_raw["siccd"] = dealer_sic_raw["siccd"].astype(float)
-            dealer_sic_raw["namedt"] = pd.to_datetime(dealer_sic_raw["namedt"])
-            dealer_sic_raw["nameendt"] = pd.to_datetime(
-                dealer_sic_raw["nameendt"].fillna("2099-12-31")
-            )
-            dealer_sic_df = dealer_sic_raw
-
-    def _get_dealer_sic_at(permno: int, date: pd.Timestamp) -> float | None:
-        """Return CRSP historical SIC code for a permno at a given date."""
-        sub = dealer_sic_df[
-            (dealer_sic_df["permno"] == permno)
-            & (dealer_sic_df["namedt"] <= date)
-            & (dealer_sic_df["nameendt"] >= date)
-        ]
-        if sub.empty:
-            return None
-        return float(sub["siccd"].iloc[0])
-
-    def _dealer_in_group(permno: int, date: pd.Timestamp, grp: str) -> bool:
-        """Return True if dealer PERMNO is in the given comparison group at date."""
-        sic = _get_dealer_sic_at(permno, date)
-        if sic is None:
-            # Unknown SIC — include in Cmpust only
-            return grp == "Cmpust"
-        sic_int = int(sic)
-        if grp == "BD":
-            return sic_int in (6211, 6221)
-        if grp == "Banks":
-            return 6000 <= sic_int <= 6299
-        return True  # Cmpust includes all
-
     # ---- Step 4: Fetch comparison group data (Compustat + CRSP) ----
     logger.info("Fetching comparison group Compustat data")
     group_comp: dict[str, pd.DataFrame] = {}
@@ -214,9 +168,9 @@ def _compute_table2_with_conn(
         t_year = t.year
         t_month = t.month
 
-        # ---- Dealer aggregates at t (computed per comparison group) ----
-        # Per paper: dealers ⊆ BD group means only BD-SIC dealers go in BD numerator.
-        # Historical SIC from CRSP msenames determines group membership.
+        # ---- Dealer aggregates at t ----
+        # Per HKM footnote 19, ALL active primary dealers appear in the numerator
+        # regardless of their holding company's SIC code.
         active = get_active_dealers(t_date)
         active_gvkeys = {d.gvkey for d in active if d.gvkey is not None}
 
@@ -264,39 +218,55 @@ def _compute_table2_with_conn(
             # No dealer data for this month; skip
             continue
 
+        # ---- Dealer aggregate (numerator): ALL active dealers for ALL groups ----
+        # Per HKM footnote 19: "define the total broker-dealer sector as the set of
+        # US primary dealers PLUS any firms with a broker-dealer SIC code (6211 or
+        # 6221). Note that had we instead relied on the SIC code definition of
+        # broker-dealers, we would miss important dealers that are subsidiaries of
+        # holding companies not classified as broker-dealers, for instance JP Morgan."
+        # Therefore ALL active primary dealers appear in the numerator regardless of
+        # their holding company's SIC code.
+        d_ta_all = sum(float(di["ta"]) for di in dealer_items)
+        d_bd_all = sum(float(di["bd"]) for di in dealer_items)
+        d_be_all = sum(float(di["be"]) for di in dealer_items)
+        d_me_all = sum(float(di["me"]) for di in dealer_items)
+
+        # Set of dealer GVKEYs active at t (for denominator construction)
+        active_dealer_gvkeys: set[str] = {str(di["gvkey"]) for di in dealer_items}
+
         # ---- Comparison group aggregates at t ----
         rec: dict[str, object] = {"date": t_ts}
 
         for grp in _GROUPS:
-            # Dealer aggregate (numerator): only dealers in this comparison group
-            d_ta = 0.0
-            d_bd_g = 0.0
-            d_be = 0.0
-            d_me = 0.0
-            for di in dealer_items:
-                perm = int(di["permno"])
-                if _dealer_in_group(perm, t_ts, grp):
-                    d_ta += float(di["ta"])
-                    d_bd_g += float(di["bd"])
-                    d_be += float(di["be"])
-                    d_me += float(di["me"])
+            rec[f"d_ta_{grp}"] = d_ta_all
+            rec[f"d_bd_{grp}"] = d_bd_all
+            rec[f"d_be_{grp}"] = d_be_all
+            rec[f"d_me_{grp}"] = d_me_all
 
-            rec[f"d_ta_{grp}"] = d_ta
-            rec[f"d_bd_{grp}"] = d_bd_g
-            rec[f"d_be_{grp}"] = d_be
-            rec[f"d_me_{grp}"] = d_me
-
-            # Comparison group aggregate (denominator)
+            # Comparison group denominator:
+            # = all active primary dealers  +  non-dealer firms in this group
+            # This matches HKM: "total broker-dealer sector = primary dealers PLUS
+            # any firms with BD SIC code." We sum dealer TA directly (not via
+            # group_comp, which only covers dealers with BD/Banks/Cmpust SIC) and add
+            # the non-dealer portion from group_comp to avoid double-counting.
             gc = group_comp[grp]
             gc_t = gc[gc["datadate"] <= t_ts]
             if not gc_t.empty:
                 gc_latest = gc_t.loc[gc_t.groupby("gvkey")["datadate"].idxmax()]
-                g_ta = float(gc_latest["atq"].sum())
-                g_bd = float(gc_latest["book_debt"].sum())
-                g_be = float(gc_latest["ceqq"].sum())
+                # Exclude dealer GVKEYs from group_comp denominator (they are
+                # already counted in d_ta_all / d_bd_all / d_be_all above).
+                gc_non_dealer = gc_latest[
+                    ~gc_latest["gvkey"].isin(active_dealer_gvkeys)
+                ]
+                g_ta = d_ta_all + float(gc_non_dealer["atq"].sum())
+                g_bd = d_bd_all + float(gc_non_dealer["book_debt"].sum())
+                g_be = d_be_all + float(gc_non_dealer["ceqq"].sum())
             else:
-                g_ta = g_bd = g_be = np.nan
+                g_ta = d_ta_all if d_ta_all > 0 else np.nan
+                g_bd = d_bd_all if d_bd_all > 0 else np.nan
+                g_be = d_be_all if d_be_all > 0 else np.nan
 
+            # Market equity: use CRSP group total (includes dealers via CRSP link)
             gc2 = group_crsp[grp]
             gc2_t = gc2[
                 (gc2["date"].dt.year == t_year) & (gc2["date"].dt.month == t_month)
