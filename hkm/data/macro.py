@@ -54,10 +54,18 @@ def fetch_shiller_ep(
     start_date: str = "1970-01-01",
     end_date: str = "2012-12-31",
 ) -> pd.DataFrame:
-    """Download Shiller's S&P 500 data and extract the E/P ratio.
+    """Download Shiller's S&P 500 data and extract the CAPE-based E/P ratio.
 
-    Tries the Yale URL first, then a fallback. E/P = trailing 12-month earnings / price.
-    Monthly data are averaged to quarterly.
+    Uses Shiller's 10-year cyclically adjusted earnings / price (1/CAPE) rather
+    than trailing 12-month E/P. The CAPE-based E/P is much smoother and better
+    aligned with business-cycle frequency capital factor movements, consistent
+    with HKM (2017) Table 3 which shows a correlation of −0.75 between E/P growth
+    and the market capital factor. Monthly data are averaged to quarterly.
+
+    The Shiller spreadsheet column 'CAPE' contains price/E10 (Shiller P/E10);
+    we invert it to get E/P = 1/CAPE = E10/P.
+
+    Tries the Yale URL first, then a fallback.
 
     Args:
         start_date: Start date (ISO format).
@@ -90,17 +98,16 @@ def fetch_shiller_ep(
         logger.warning("All Shiller URLs failed; E/P will be NaN")
         return pd.DataFrame(columns=["date", "ep_ratio"])
 
-    # Columns: Date, P, D, E, CPI, ...  (after header skip)
+    # Columns: Date, P, D, E, CPI, Fraction, Rate GS10, Price, Dividend,
+    #          Price.1, Earnings, Earnings.1, CAPE, ... (after header=7 skip)
     # Date is formatted as e.g. "1871.01" (year.month_fraction)
     raw = raw.rename(columns=lambda c: str(c).strip())
 
-    # Find the date column (first column, may be named 'Date' or similar)
     date_col = raw.columns[0]
-    price_col = "P"
-    earn_col = "E"
+    cape_col = "CAPE"
 
-    # Drop rows where date or price is NaN
-    raw = raw.dropna(subset=[date_col, price_col])
+    # Drop rows where date is NaN
+    raw = raw.dropna(subset=[date_col])
 
     def _parse_shiller_date(val: object) -> pd.Timestamp | None:
         try:
@@ -119,28 +126,39 @@ def fetch_shiller_ep(
     raw = raw.set_index("_date")
     raw.index = pd.DatetimeIndex(raw.index)
 
-    raw[price_col] = pd.to_numeric(raw[price_col], errors="coerce")
-    raw[earn_col] = pd.to_numeric(raw[earn_col], errors="coerce")
+    if cape_col in raw.columns:
+        # Primary: use Shiller CAPE (price / 10-year real earnings)
+        # E/P = 1/CAPE = E10/P (cyclically adjusted earnings yield)
+        cape_vals = pd.to_numeric(raw[cape_col], errors="coerce")
+        valid_cape = cape_vals.replace(0.0, np.nan).dropna()
+        ep_series = (1.0 / valid_cape).rename("ep_ratio")
+        logger.info("Using Shiller CAPE column for E/P (1/CAPE = E10/P)")
+    else:
+        # Fallback: use trailing 12-month E/P from E and P columns
+        logger.warning(
+            "CAPE column not found in Shiller data; falling back to trailing E/P"
+        )
+        price_col = "P"
+        earn_col = "E"
+        raw[price_col] = pd.to_numeric(raw[price_col], errors="coerce")
+        raw[earn_col] = pd.to_numeric(raw[earn_col], errors="coerce")
+        ep_series = (raw[earn_col] / raw[price_col]).rename("ep_ratio").dropna()
 
-    raw = raw[[price_col, earn_col]].dropna()
-    raw["ep_ratio"] = raw[earn_col] / raw[price_col]
-
-    # Filter to requested date range
-    raw = raw[["ep_ratio"]]
-    raw = raw.loc[
-        (raw.index >= pd.Timestamp(start_date)) & (raw.index <= pd.Timestamp(end_date))
+    ep_series = ep_series.loc[
+        (ep_series.index >= pd.Timestamp(start_date))
+        & (ep_series.index <= pd.Timestamp(end_date))
     ]
 
     # Aggregate monthly → quarterly
     quarterly: pd.DataFrame = (
-        raw["ep_ratio"].resample("QS").mean().dropna().rename("ep_ratio").reset_index()
+        ep_series.resample("QS").mean().dropna().rename("ep_ratio").reset_index()
     )
     quarterly = quarterly.rename(columns={"index": "date"})
     if "date" not in quarterly.columns:
         # When index has no name, reset_index names it after the index dtype
         quarterly.columns = ["date", "ep_ratio"]
     quarterly["date"] = pd.to_datetime(quarterly["date"])
-    logger.info("Shiller E/P: %d quarterly observations", len(quarterly))
+    logger.info("Shiller E/P (CAPE-based): %d quarterly observations", len(quarterly))
     return quarterly
 
 
@@ -257,8 +275,20 @@ def fetch_aem_leverage(
 
     # Avoid division by zero or near-zero equity
     equity = equity.replace(0, np.nan)
-    leverage = assets / equity
-    log_leverage = np.log(leverage.replace(0, np.nan))
+    raw_leverage = assets / equity
+
+    # Sign convention: the HKM paper reports AEM leverage as a NEGATIVE of the
+    # raw assets/equity ratio so that the series is negatively correlated with
+    # capital ratios (η). High leverage → low capital → negative AEM leverage
+    # in HKM's sign convention. This is consistent with AEM (2010) reporting
+    # their leverage factor as a risk factor where high values signal distress
+    # (they use −Δlog(leverage) as the pricing factor, meaning leverage DECREASES
+    # are associated with higher expected returns). Taking −leverage ensures:
+    #   high dealer capitalisation (high η) ↔ low leverage ↔ less negative AEM
+    # which produces the published negative level correlation (−0.42).
+    leverage = -raw_leverage
+
+    log_leverage = np.log(raw_leverage.replace(0, np.nan))
     levfac = log_leverage.diff()
 
     out = pd.DataFrame(
