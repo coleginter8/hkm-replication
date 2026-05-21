@@ -234,6 +234,9 @@ def _compute_table2_with_conn(
         # Set of dealer GVKEYs active at t (for denominator construction)
         active_dealer_gvkeys: set[str] = {str(di["gvkey"]) for di in dealer_items}
 
+        # Set of dealer PERMNOs active at t (for CRSP ME denominator construction)
+        active_dealer_permnos: set[int] = {int(di["permno"]) for di in dealer_items}
+
         # ---- Comparison group aggregates at t ----
         rec: dict[str, object] = {"date": t_ts}
 
@@ -243,7 +246,7 @@ def _compute_table2_with_conn(
             rec[f"d_be_{grp}"] = d_be_all
             rec[f"d_me_{grp}"] = d_me_all
 
-            # Comparison group denominator:
+            # Comparison group denominator (book items):
             # = all active primary dealers  +  non-dealer firms in this group
             # This matches HKM: "total broker-dealer sector = primary dealers PLUS
             # any firms with BD SIC code." We sum dealer TA directly (not via
@@ -266,12 +269,27 @@ def _compute_table2_with_conn(
                 g_bd = d_bd_all if d_bd_all > 0 else np.nan
                 g_be = d_be_all if d_be_all > 0 else np.nan
 
-            # Market equity: use CRSP group total (includes dealers via CRSP link)
+            # Market equity denominator: dealer ME + non-dealer group-SIC CRSP ME.
+            # Per HKM footnote 19: the total BD sector = primary dealers PLUS
+            # any SIC 6211/6221 firms. Some dealers (e.g. JPMorgan SIC 6020) are
+            # in d_me_all but NOT in the SIC-filtered CRSP pull for BD group.
+            # Therefore: g_me = d_me_all + Σ ME_{j ∈ group_crsp, j ∉ dealers}.
+            # This prevents ME/BD ratio from ever exceeding 1.0.
             gc2 = group_crsp[grp]
             gc2_t = gc2[
                 (gc2["date"].dt.year == t_year) & (gc2["date"].dt.month == t_month)
             ]
-            g_me = float(gc2_t["me"].sum()) / 1000.0 if not gc2_t.empty else np.nan
+            if not gc2_t.empty:
+                # Non-dealer CRSP firms in this group's SIC filter
+                gc2_non_dealer = gc2_t[
+                    ~gc2_t["permno"].isin(active_dealer_permnos)
+                ]
+                non_dealer_crsp_me = float(gc2_non_dealer["me"].sum()) / 1000.0
+                # Total group ME = dealer ME (all dealers, regardless of SIC) +
+                # non-dealer group-SIC ME from CRSP
+                g_me = d_me_all + non_dealer_crsp_me
+            else:
+                g_me = d_me_all if d_me_all > 0 else np.nan
 
             rec[f"g_ta_{grp}"] = g_ta
             rec[f"g_bd_{grp}"] = g_bd

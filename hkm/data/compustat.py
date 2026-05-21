@@ -33,12 +33,12 @@ def fetch_compustat_quarterly(
     if not gvkeys:
         logger.warning("fetch_compustat_quarterly called with empty gvkeys list")
         return pd.DataFrame(
-            columns=["gvkey", "datadate", "atq", "ceqq", "book_debt", "fyearq", "fqtr"]
+            columns=["gvkey", "datadate", "rdq", "atq", "ceqq", "book_debt", "fyearq", "fqtr"]
         )
 
     placeholders = ", ".join(f"'{g}'" for g in gvkeys)
     sql = f"""
-        SELECT gvkey, datadate, atq, ceqq, fyearq, fqtr
+        SELECT gvkey, datadate, rdq, atq, ceqq, fyearq, fqtr
         FROM comp.fundq
         WHERE gvkey IN ({placeholders})
           AND datadate BETWEEN '{start_date}' AND '{end_date}'
@@ -56,10 +56,11 @@ def fetch_compustat_quarterly(
         df = run_query(sql, c)
         if df.empty:
             return pd.DataFrame(
-                columns=["gvkey", "datadate", "atq", "ceqq", "book_debt", "fyearq", "fqtr"]
+                columns=["gvkey", "datadate", "rdq", "atq", "ceqq", "book_debt", "fyearq", "fqtr"]
             )
         df["gvkey"] = df["gvkey"].astype(str).str.zfill(6)
         df["datadate"] = pd.to_datetime(df["datadate"])
+        df["rdq"] = pd.to_datetime(df["rdq"], errors="coerce")
         df["atq"] = df["atq"].astype(float)
         df["ceqq"] = df["ceqq"].astype(float)
         df["book_debt"] = df["atq"] - df["ceqq"]
@@ -85,6 +86,7 @@ def fetch_compustat_all_quarterly(
     start_date: str = "1960-01-01",
     end_date: str = "2012-12-31",
     conn: psycopg2.extensions.connection | None = None,
+    lookback_months: int = 18,
 ) -> pd.DataFrame:
     """Fetch quarterly Compustat data for comparison groups (BD, Banks, all firms).
 
@@ -103,13 +105,21 @@ def fetch_compustat_all_quarterly(
     annual report. This is superior to comp.names.sic (which reflects only the final,
     current SIC code).
 
+    The query extends back by ``lookback_months`` before ``start_date`` so that at
+    each target date t, the most recent filing within 18 months of t is available.
+    This avoids sparse-coverage issues for early years (pre-1978) where delayed
+    filings might otherwise cause firms to be excluded from the comparison group.
+
     Args:
         sic_filter: 'BD' for sich IN ('6211', '6221'),
                     'Banks' for sich BETWEEN '6000' AND '6299',
                     None for all firms (no SIC filter, but still US-listed).
-        start_date: Earliest datadate to include (ISO format).
+        start_date: Earliest target date (ISO format). The SQL query fetches filings
+                    from ``start_date - lookback_months`` to ``end_date``.
         end_date: Latest datadate to include (ISO format).
         conn: Open psycopg2 connection, or None to open one internally.
+        lookback_months: Number of months before start_date to include in the SQL
+                    query to support firms with delayed filings (default 18).
 
     Returns:
         DataFrame with columns: gvkey (str), datadate (Timestamp), atq (float),
@@ -119,6 +129,12 @@ def fetch_compustat_all_quarterly(
 
     def _execute(c: psycopg2.extensions.connection) -> pd.DataFrame:
         filter_label = sic_filter if sic_filter else "All"
+
+        # Extend the SQL fetch window back by lookback_months to capture filings
+        # that belong to comparison groups but arrived slightly before start_date.
+        fetch_start = (
+            pd.Timestamp(start_date) - pd.DateOffset(months=lookback_months)
+        ).strftime("%Y-%m-%d")
 
         # Build SIC filter for comp.funda.sich (integer column in WRDS PostgreSQL)
         if sic_filter == "BD":
@@ -170,6 +186,8 @@ def fetch_compustat_all_quarterly(
         # Join fundq to funda (annual) on gvkey + fyearq = fyear to get historical
         # SIC from the annual report that corresponds to each quarterly filing.
         # DISTINCT ON (q.gvkey, q.datadate) prevents duplicates from multiple CRSP links.
+        # The lookback window (fetch_start → end_date) ensures that at each target
+        # month t, the most recent filing within the prior 18 months is available.
         sql = f"""
             SELECT DISTINCT ON (q.gvkey, q.datadate)
                    q.gvkey,
@@ -189,7 +207,7 @@ def fetch_compustat_all_quarterly(
                AND a.consol = 'C'
                {sic_clause}
             {crsp_join}
-            WHERE q.datadate BETWEEN '{start_date}' AND '{end_date}'
+            WHERE q.datadate BETWEEN '{fetch_start}' AND '{end_date}'
               AND q.datafmt = 'STD'
               AND q.indfmt = 'INDL'
               AND q.popsrc = 'D'
