@@ -393,11 +393,14 @@ def build_macro_panel(
     panel.index.name = "quarter"
 
     # --- Growth rates for Panel B ---
+    # E/P growth: year-over-year (4-quarter) log change per HKM paper
+    # (quarter-over-quarter is too noisy; paper uses annual change in E/P)
     if "ep_ratio" in panel.columns:
-        panel["ep_growth"] = np.log(panel["ep_ratio"] / panel["ep_ratio"].shift(1))
+        panel["ep_growth"] = np.log(panel["ep_ratio"] / panel["ep_ratio"].shift(4))
     else:
         panel["ep_growth"] = np.nan
 
+    # Unemployment growth: quarter-over-quarter log change
     if "unemp" in panel.columns:
         panel["unemp_growth"] = np.log(panel["unemp"] / panel["unemp"].shift(1))
     else:

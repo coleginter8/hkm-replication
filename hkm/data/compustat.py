@@ -88,50 +88,124 @@ def fetch_compustat_all_quarterly(
 ) -> pd.DataFrame:
     """Fetch quarterly Compustat data for comparison groups (BD, Banks, all firms).
 
+    Uses comp.funda.sich (historical SIC from annual filings) joined to comp.fundq
+    to identify which firms belong to each comparison group at each point in time.
+    This is the correct approach per HKM (2017) footnote 19: "the total broker-dealer
+    sector as the set of US primary dealers plus any firms with a broker-dealer SIC
+    code (6211 or 6221)."
+
+    For BD/Banks groups, firms are additionally filtered to US-listed ordinary common
+    stocks (crsp.msenames.shrcd IN (10, 11)) via the CCM link table to exclude foreign
+    firms (e.g., Credit Suisse Group, Nomura Holdings) from the comparison group.
+
+    The annual historical SIC (comp.funda.sich) is matched to quarterly filings via
+    fyearq = fyear, so each quarterly filing uses the SIC code from the corresponding
+    annual report. This is superior to comp.names.sic (which reflects only the final,
+    current SIC code).
+
     Args:
-        sic_filter: 'BD' for SIC 6211/6221, 'Banks' for SIC 6000–6299, None for all.
+        sic_filter: 'BD' for sich IN ('6211', '6221'),
+                    'Banks' for sich BETWEEN '6000' AND '6299',
+                    None for all firms (no SIC filter, but still US-listed).
         start_date: Earliest datadate to include (ISO format).
         end_date: Latest datadate to include (ISO format).
         conn: Open psycopg2 connection, or None to open one internally.
 
     Returns:
         DataFrame with columns: gvkey (str), datadate (Timestamp), atq (float),
-        ceqq (float), sich (str), book_debt (float).
-    """
-    # SIC codes live in comp.names (column: sic), not in comp.fundq.
-    # Join fundq with names to filter by SIC.
-    if sic_filter == "BD":
-        sic_clause = "AND n.sic IN ('6211', '6221')"
-    elif sic_filter == "Banks":
-        sic_clause = (
-            "AND n.sic IS NOT NULL AND n.sic ~ '^[0-9]+$' "
-            "AND CAST(n.sic AS INTEGER) BETWEEN 6000 AND 6299"
-        )
-    else:
-        sic_clause = ""
-
-    sql = f"""
-        SELECT q.gvkey, q.datadate, q.atq, q.ceqq, n.sic AS sich, q.fyearq, q.fqtr
-        FROM comp.fundq q
-        JOIN comp.names n ON q.gvkey = n.gvkey
-        WHERE q.datadate BETWEEN '{start_date}' AND '{end_date}'
-          AND q.datafmt = 'STD'
-          AND q.indfmt = 'INDL'
-          AND q.popsrc = 'D'
-          AND q.consol = 'C'
-          AND q.atq IS NOT NULL
-          AND q.atq > 0
-          AND q.ceqq IS NOT NULL
-          {sic_clause}
-        ORDER BY q.gvkey, q.datadate
+        ceqq (float), sich (str), book_debt (float), fyearq (int), fqtr (int).
+        sich is the historical annual SIC from comp.funda.
     """
 
     def _execute(c: psycopg2.extensions.connection) -> pd.DataFrame:
+        filter_label = sic_filter if sic_filter else "All"
+
+        # Build SIC filter for comp.funda.sich (integer column in WRDS PostgreSQL)
+        if sic_filter == "BD":
+            sic_clause = "AND a.sich IN (6211, 6221)"
+            crsp_join = """
+                JOIN crsp.ccmxpf_linktable lk
+                    ON q.gvkey = lk.gvkey
+                   AND lk.linktype IN ('LU', 'LC', 'LS')
+                   AND lk.linkprim IN ('P', 'C')
+                   AND q.datadate BETWEEN lk.linkdt
+                       AND COALESCE(lk.linkenddt, '2099-12-31'::date)
+                JOIN crsp.msenames e
+                    ON lk.lpermno = e.permno
+                   AND q.datadate BETWEEN e.namedt
+                       AND COALESCE(e.nameendt, '2099-12-31'::date)
+                   AND e.shrcd IN (10, 11)
+            """
+        elif sic_filter == "Banks":
+            sic_clause = "AND a.sich BETWEEN 6000 AND 6299"
+            crsp_join = """
+                JOIN crsp.ccmxpf_linktable lk
+                    ON q.gvkey = lk.gvkey
+                   AND lk.linktype IN ('LU', 'LC', 'LS')
+                   AND lk.linkprim IN ('P', 'C')
+                   AND q.datadate BETWEEN lk.linkdt
+                       AND COALESCE(lk.linkenddt, '2099-12-31'::date)
+                JOIN crsp.msenames e
+                    ON lk.lpermno = e.permno
+                   AND q.datadate BETWEEN e.namedt
+                       AND COALESCE(e.nameendt, '2099-12-31'::date)
+                   AND e.shrcd IN (10, 11)
+            """
+        else:
+            sic_clause = ""
+            crsp_join = """
+                JOIN crsp.ccmxpf_linktable lk
+                    ON q.gvkey = lk.gvkey
+                   AND lk.linktype IN ('LU', 'LC', 'LS')
+                   AND lk.linkprim IN ('P', 'C')
+                   AND q.datadate BETWEEN lk.linkdt
+                       AND COALESCE(lk.linkenddt, '2099-12-31'::date)
+                JOIN crsp.msenames e
+                    ON lk.lpermno = e.permno
+                   AND q.datadate BETWEEN e.namedt
+                       AND COALESCE(e.nameendt, '2099-12-31'::date)
+                   AND e.shrcd IN (10, 11)
+            """
+
+        # Join fundq to funda (annual) on gvkey + fyearq = fyear to get historical
+        # SIC from the annual report that corresponds to each quarterly filing.
+        # DISTINCT ON (q.gvkey, q.datadate) prevents duplicates from multiple CRSP links.
+        sql = f"""
+            SELECT DISTINCT ON (q.gvkey, q.datadate)
+                   q.gvkey,
+                   q.datadate,
+                   q.atq,
+                   q.ceqq,
+                   CAST(a.sich AS VARCHAR) AS sich,
+                   q.fyearq,
+                   q.fqtr
+            FROM comp.fundq q
+            JOIN comp.funda a
+                ON q.gvkey = a.gvkey
+               AND q.fyearq = a.fyear
+               AND a.datafmt = 'STD'
+               AND a.indfmt = 'INDL'
+               AND a.popsrc = 'D'
+               AND a.consol = 'C'
+               {sic_clause}
+            {crsp_join}
+            WHERE q.datadate BETWEEN '{start_date}' AND '{end_date}'
+              AND q.datafmt = 'STD'
+              AND q.indfmt = 'INDL'
+              AND q.popsrc = 'D'
+              AND q.consol = 'C'
+              AND q.atq IS NOT NULL
+              AND q.atq > 0
+              AND q.ceqq IS NOT NULL
+            ORDER BY q.gvkey, q.datadate
+        """
         df = run_query(sql, c)
         if df.empty:
+            logger.warning("No data found for sic_filter=%s", filter_label)
             return pd.DataFrame(
                 columns=["gvkey", "datadate", "atq", "ceqq", "sich", "book_debt", "fyearq", "fqtr"]
             )
+
         df["gvkey"] = df["gvkey"].astype(str).str.zfill(6)
         df["datadate"] = pd.to_datetime(df["datadate"])
         df["atq"] = df["atq"].astype(float)
@@ -141,7 +215,6 @@ def fetch_compustat_all_quarterly(
         df = df.dropna(subset=["fyearq", "fqtr"])
         df["fyearq"] = df["fyearq"].astype(int)
         df["fqtr"] = df["fqtr"].astype(int)
-        filter_label = sic_filter if sic_filter else "All"
         logger.info(
             "Compustat all: fetched %d rows, sic_filter=%s, date range %s–%s",
             len(df),
