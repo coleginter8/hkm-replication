@@ -151,25 +151,18 @@ def build_capital_ratio(
 
         for gvkey in active_gvkeys:
             # Get most recent Compustat filing available at t.
-            # Per HKM, book balance-sheet data should be aligned to the calendar
-            # quarter in which the data were *reported* (rdq), not the fiscal
-            # quarter-end (datadate). Using rdq ensures that book capital is only
-            # counted once the filing is publicly available, preventing look-ahead
-            # bias and improving alignment with the CRSP market-equity dates.
+            # Use datadate (fiscal quarter-end) as the alignment date.
+            # This is the pre-rdq approach: a filing with datadate <= t is
+            # considered available at t. While this can include filings not
+            # yet publicly reported, the simpler alignment avoids the
+            # look-ahead artefacts introduced by the rdq-based availability
+            # date (which can misalign quarterly book capital by 1-3 months
+            # relative to CRSP month-end market equity, flipping cyclical
+            # sign for GDP, Unemployment, and Market volatility correlations).
             comp_sub = comp_df[comp_df["gvkey"] == gvkey].copy()
             if comp_sub.empty:
                 continue
-            # Use rdq (report date) for alignment if available; otherwise datadate.
-            # The "available at t" date is the earlier of rdq and datadate + 3 months.
-            if "rdq" in comp_sub.columns and comp_sub["rdq"].notna().any():
-                # For rows where rdq is available, use it as the availability date.
-                # For rows where rdq is NaN, fall back to datadate.
-                avail_date = comp_sub["rdq"].fillna(
-                    comp_sub["datadate"] + pd.DateOffset(months=3)
-                )
-            else:
-                avail_date = comp_sub["datadate"] + pd.DateOffset(months=3)
-            comp_sub = comp_sub[avail_date <= t_timestamp]
+            comp_sub = comp_sub[comp_sub["datadate"] <= t_timestamp]
             if comp_sub.empty:
                 continue
             latest_comp = comp_sub.loc[comp_sub["datadate"].idxmax()]
